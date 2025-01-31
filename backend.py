@@ -1,225 +1,236 @@
-# -- coding: utf-8 --
 import sys
-import threading
-import asyncio
 import json
-import base64
+import asyncio
 import websockets
+import threading
+import numpy as np
+import cv2
 from ctypes import *
 from MvImport.MvCameraControl_class import *
-import os
-import time
 
-sys.path.append("../MvImport")
-
-# Global variables
-streaming_active = False
-current_cam = None
-
-def enumerate_devices():
-    deviceList = MV_CC_DEVICE_INFO_LIST()
-    tlayerType = MV_GIGE_DEVICE | MV_USB_DEVICE
-    ret = MvCamera.MV_CC_EnumDevices(tlayerType, deviceList)
-    if ret != 0:
-        return []
-    
-    devices = []
-    for i in range(deviceList.nDeviceNum):
-        mvcc_dev_info = cast(deviceList.pDeviceInfo[i], POINTER(MV_CC_DEVICE_INFO)).contents
-        device_info = {"index": i}
+class CameraManager:
+    def __init__(self):
+        self.cam = None
+        self.device_list = []
+        self.streaming = False
+        self.current_device_index = -1
+        self.frame_convert_param = None
+        self.buf_cache = None
+        self.loop = None
         
-        if mvcc_dev_info.nTLayerType == MV_GIGE_DEVICE:
-            device_info["type"] = "GigE"
-            # Model name
-            model_name = ""
-            for c in mvcc_dev_info.SpecialInfo.stGigEInfo.chModelName:
-                if c == 0: break
-                model_name += chr(c)
-            device_info["model"] = model_name
-            
-            # IP address
-            ip = mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp
-            device_info["ip"] = ".".join([
-                str((ip >> 24) & 0xFF),
-                str((ip >> 16) & 0xFF),
-                str((ip >> 8) & 0xFF),
-                str(ip & 0xFF)
-            ])
-            
-        elif mvcc_dev_info.nTLayerType == MV_USB_DEVICE:
-            device_info["type"] = "USB"
-            # Model name
-            model_name = ""
-            for c in mvcc_dev_info.SpecialInfo.stUsb3VInfo.chModelName:
-                if c == 0: break
-                model_name += chr(c)
-            device_info["model"] = model_name
-            
-            # Serial number
-            serial = ""
-            for c in mvcc_dev_info.SpecialInfo.stUsb3VInfo.chSerialNumber:
-                if c == 0: break
-                serial += chr(c)
-            device_info["serial"] = serial
-            
-        devices.append(device_info)
-    
-    return devices
+    def set_event_loop(self, loop):
+        self.loop = loop
 
-def get_pixel_format(pixel_type):
-    formats = {
-        PixelType_Gvsp_Mono8: "Mono8",
-        PixelType_Gvsp_BayerRG8: "BayerRG8",
-        PixelType_Gvsp_BayerGR8: "BayerGR8",
-        PixelType_Gvsp_BayerGB8: "BayerGB8",
-        PixelType_Gvsp_BayerBG8: "BayerBG8",
-        PixelType_Gvsp_RGB8_Packed: "RGB8",
-        PixelType_Gvsp_BGR8_Packed: "BGR8",
-    }
-    return formats.get(pixel_type, "Unknown")
+    def enum_devices(self):
+        self.device_list = []
+        deviceList = MV_CC_DEVICE_INFO_LIST()
+        tlayerType = MV_GIGE_DEVICE | MV_USB_DEVICE
+        ret = MvCamera.MV_CC_EnumDevices(tlayerType, deviceList)
+        if ret != 0:
+            return []
 
-def get_frame(cam):
-    stOutFrame = MV_FRAME_OUT()
-    memset(byref(stOutFrame), 0, sizeof(stOutFrame))
-    ret = cam.MV_CC_GetImageBuffer(stOutFrame, 1000)
-    if ret != 0:
-        return None
-    
-    try:
-        buffer_length = int(stOutFrame.stFrameInfo.nFrameLen)
-        buffer = (c_ubyte * buffer_length).from_address(stOutFrame.pBufAddr)
-        data = bytes(buffer)
-        return {
-            "data": data,
-            "width": int(stOutFrame.stFrameInfo.nWidth),
-            "height": int(stOutFrame.stFrameInfo.nHeight),
-            "format": get_pixel_format(stOutFrame.stFrameInfo.enPixelType)
-        }
-    except Exception as e:
-        print(f"Error processing frame: {e}")
-        return None
-    finally:
-        cam.MV_CC_FreeImageBuffer(stOutFrame)
-
-async def stream_frames(websocket, cam):
-    global streaming_active
-    frame_count = 0
-    try:
-        while streaming_active:
-            loop = asyncio.get_event_loop()
-            frame = await loop.run_in_executor(None, get_frame, cam)
-            if not frame:
-                print("No frame received")
-                continue
+        for i in range(deviceList.nDeviceNum):
+            device_ptr = deviceList.pDeviceInfo[i]
+            mvcc_dev_info = cast(device_ptr, POINTER(MV_CC_DEVICE_INFO)).contents
             
-            # Save the first frame to disk for debugging
-            if frame_count == 0:
-                timestamp = int(time.time())
-                filename = f"frame_{timestamp}.raw"
-                with open(filename, "wb") as f:
-                    f.write(frame["data"])
-                print(f"Saved first frame to {filename}")
-                frame_count += 1
-            
-            frame_data = base64.b64encode(frame["data"]).decode("utf-8")
-            await websocket.send(json.dumps({
-                "type": "frame",
-                "width": frame["width"],
-                "height": frame["height"],
-                "format": frame["format"],
-                "data": frame_data
-            }))
-    except Exception as e:
-        await websocket.send(json.dumps({"error": f"frame error: {str(e)}"}))
-    finally:
-        streaming_active = False
+            device_info = {
+                "index": i,
+                "ptr": device_ptr,
+                "type": "GigE" if mvcc_dev_info.nTLayerType == MV_GIGE_DEVICE else "USB"
+            }
 
-async def handle_client(websocket):
-    global streaming_active, current_cam
-    current_cam = None
-    
-    async for message in websocket:
+            if mvcc_dev_info.nTLayerType == MV_GIGE_DEVICE:
+                model_name = "".join([chr(c) for c in mvcc_dev_info.SpecialInfo.stGigEInfo.chModelName if c != 0])
+                ip = mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp
+                device_info.update({
+                    "model": model_name,
+                    "ip": f"{(ip>>24)&0xFF}.{(ip>>16)&0xFF}.{(ip>>8)&0xFF}.{ip&0xFF}"
+                })
+            else:
+                model_name = "".join([chr(c) for c in mvcc_dev_info.SpecialInfo.stUsb3VInfo.chModelName if c != 0])
+                serial = "".join([chr(c) for c in mvcc_dev_info.SpecialInfo.stUsb3VInfo.chSerialNumber if c != 0])
+                device_info.update({
+                    "model": model_name,
+                    "serial": serial
+                })
+            
+            self.device_list.append(device_info)
+        
+        return self.device_list
+
+    def open_camera(self, index):
+        if index < 0 or index >= len(self.device_list):
+            raise ValueError("Invalid device index")
+            
+        self.current_device_index = index
+        device_info = self.device_list[index]
+        st_device_info = cast(device_info['ptr'], POINTER(MV_CC_DEVICE_INFO)).contents
+        
+        self.cam = MvCamera()
+        ret = self.cam.MV_CC_CreateHandle(st_device_info)
+        if ret != 0:
+            raise Exception(f"Create handle failed: {ret}")
+            
+        ret = self.cam.MV_CC_OpenDevice(MV_ACCESS_Exclusive, 0)
+        if ret != 0:
+            raise Exception(f"Open device failed: {ret}")
+            
+        # Configure default settings
+        self.cam.MV_CC_SetEnumValue("TriggerMode", MV_TRIGGER_MODE_OFF)
+        self.cam.MV_CC_SetEnumValue("AcquisitionMode", MV_ACQ_MODE_CONTINUOUS)
+        return True
+
+    def start_stream(self, websocket):
+        self.streaming = True
+        stOutFrame = MV_FRAME_OUT()
+        
+        ret = self.cam.MV_CC_StartGrabbing()
+        if ret != 0:
+            raise Exception(f"Start grabbing failed: {ret}")
+
+        while self.streaming:
+            ret = self.cam.MV_CC_GetImageBuffer(stOutFrame, 1000)
+            if ret == 0:
+                try:
+                    frame_info = stOutFrame.stFrameInfo
+                    print(f"Received frame: {frame_info.nWidth}x{frame_info.nHeight}. Pixel Type: {frame_info.enPixelType}")
+
+                    # Use SDK to convert directly to JPEG buffer
+                    stParam = MV_SAVE_IMAGE_PARAM_EX()
+                    stParam.enImageType = MV_Image_Jpeg
+                    stParam.enPixelType = frame_info.enPixelType
+                    stParam.nWidth = frame_info.nWidth
+                    stParam.nHeight = frame_info.nHeight
+                    stParam.nDataLen = frame_info.nFrameLen
+                    stParam.pData = cast(stOutFrame.pBufAddr, POINTER(c_ubyte))
+                    stParam.nJpgQuality = 80  # Adjust quality as needed
+
+                    # Allocate buffer for JPEG
+                    jpeg_buffer_size = frame_info.nWidth * frame_info.nHeight * 3 + 2048
+                    stParam.pImageBuffer = (c_ubyte * jpeg_buffer_size)()
+                    stParam.nBufferSize = jpeg_buffer_size
+
+                    # Perform conversion to JPEG
+                    ret = self.cam.MV_CC_SaveImageEx2(stParam)
+                    if ret != 0:
+                        raise Exception(f"JPEG conversion failed: 0x{self.To_hex_str(ret)}")
+
+                    # Extract JPEG data
+                    jpeg_data = bytes(stParam.pImageBuffer[:stParam.nImageLen])
+
+                    # Send through WebSocket
+                    asyncio.run_coroutine_threadsafe(
+                        self.send_frame(websocket, jpeg_data),
+                        self.loop
+                    )
+                finally:
+                    self.cam.MV_CC_FreeImageBuffer(stOutFrame)
+                        
+    async def send_frame(self, websocket, data):
+        try:
+            await websocket.send(data)
+        except Exception as e:
+            print(f"Error sending frame: {str(e)}")
+
+    def convert_to_jpeg(self, frame_out):
+        frame_info = frame_out.stFrameInfo
+        convert_param = MV_CC_PIXEL_CONVERT_PARAM()
+        convert_param.nWidth = frame_info.nWidth
+        convert_param.nHeight = frame_info.nHeight
+        convert_param.pSrcData = frame_out.pBufAddr
+        convert_param.nSrcDataLen = frame_info.nFrameLen
+        convert_param.enSrcPixelType = frame_info.enPixelType
+        convert_param.enDstPixelType = PixelType_Gvsp_RGB8_Packed
+        
+        buffer_size = frame_info.nWidth * frame_info.nHeight * 3
+        convert_param.pDstBuffer = (c_ubyte * buffer_size)()
+        convert_param.nDstBufferSize = buffer_size
+        
+        ret = self.cam.MV_CC_ConvertPixelType(convert_param)
+        if ret != 0:
+            raise Exception("Pixel conversion failed")
+        rgb_data = np.frombuffer(convert_param.pDstBuffer, dtype=np.uint8)
+        rgb_data = rgb_data.reshape((frame_info.nHeight, frame_info.nWidth, 3))
+        _, jpeg_buffer = cv2.imencode('.jpg', rgb_data)
+        return jpeg_buffer.tobytes()
+
+    def stop_stream(self):
+        print("Stop Streaming")
+        self.streaming = False
+        self.cam.MV_CC_StopGrabbing()
+
+    def close_camera(self):
+        if self.cam:
+            print("Camera closed")
+            self.stop_stream()
+            self.cam.MV_CC_CloseDevice()
+            self.cam.MV_CC_DestroyHandle()
+            self.cam = None
+
+class WebSocketServer:
+    def __init__(self):
+        self.cam_manager = CameraManager()
+        self.active_connections = set()
+
+    async def handler(self, websocket):
+        self.active_connections.add(websocket)
+        try:
+            # Pass the main event loop to camera manager
+            self.cam_manager.set_event_loop(asyncio.get_running_loop())
+            async for message in websocket:
+                await self.handle_message(websocket, message)
+        finally:
+            self.active_connections.remove(websocket)
+
+    async def handle_message(self, websocket, message):
         try:
             msg = json.loads(message)
-            cmd = msg.get("command")
+            command = msg.get('command')
             
-            if cmd == "get_devices":
-                devices = enumerate_devices()
-                await websocket.send(json.dumps({
-                    "command": "devices",
-                    "count": len(devices),
-                    "devices": devices
-                }))
+            if command == 'get_devices':
+                devices = self.cam_manager.enum_devices()
+                response = {
+                    "message": f"Found {len(devices)} devices",
+                    "devices": [{"index": d["index"], "type": d["type"], "model": d["model"], "serial": d["serial"]} for d in devices]
+                }
+                await websocket.send(json.dumps(response))
                 
-            elif cmd == "start_stream":
-                if streaming_active:
-                    await websocket.send(json.dumps({"error": "Stream already active"}))
-                    continue
+            elif command == 'start_stream':
+                index = msg.get('index', 0)
+                if index >= len(self.cam_manager.device_list):
+                    raise ValueError("Invalid device index")
                 
-                device_index = msg.get("device_index", 0)
-                deviceList = MV_CC_DEVICE_INFO_LIST()
-                ret = MvCamera.MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, deviceList)
-                if ret != 0 or deviceList.nDeviceNum == 0:
-                    await websocket.send(json.dumps({"error": "No devices found"}))
-                    continue
+                self.cam_manager.open_camera(index)
+                threading.Thread(
+                    target=self.cam_manager.start_stream,
+                    args=(websocket,),
+                    daemon=True
+                ).start()
+                await websocket.send(json.dumps({"status": "streaming_started"}))
                 
-                if device_index >= deviceList.nDeviceNum:
-                    await websocket.send(json.dumps({"error": "Invalid device index"}))
-                    continue
+            elif command == 'stop_stream':
+                # self.cam_manager.stop_stream()
+                self.cam_manager.close_camera()
+                await websocket.send(json.dumps({"status": "streaming_stopped"}))
                 
-                stDevice = cast(deviceList.pDeviceInfo[device_index], POINTER(MV_CC_DEVICE_INFO)).contents
-                cam = MvCamera()
-                ret = cam.MV_CC_CreateHandle(stDevice)
-                if ret != 0:
-                    await websocket.send(json.dumps({"error": "Create handle failed"}))
-                    continue
-                
-                ret = cam.MV_CC_OpenDevice(MV_ACCESS_Exclusive, 0)
-                if ret != 0:
-                    await websocket.send(json.dumps({"error": "Open device failed"}))
-                    cam.MV_CC_DestroyHandle()
-                    continue
-                
-                if stDevice.nTLayerType == MV_GIGE_DEVICE:
-                    packet_size = cam.MV_CC_GetOptimalPacketSize()
-                    if packet_size > 0:
-                        cam.MV_CC_SetIntValue("GevSCPSPacketSize", packet_size)
-                
-                ret = cam.MV_CC_SetEnumValue("TriggerMode", MV_TRIGGER_MODE_OFF)
-                if ret != 0:
-                    await websocket.send(json.dumps({"error": "Set trigger mode failed"}))
-                    cam.MV_CC_CloseDevice()
-                    cam.MV_CC_DestroyHandle()
-                    continue
-                
-                ret = cam.MV_CC_StartGrabbing()
-                if ret != 0:
-                    await websocket.send(json.dumps({"error": "Start grabbing failed"}))
-                    cam.MV_CC_CloseDevice()
-                    cam.MV_CC_DestroyHandle()
-                    continue
-                
-                streaming_active = True
-                current_cam = cam
-                asyncio.create_task(stream_frames(websocket, cam))
-                
-            elif cmd == "stop_stream":
-                streaming_active = False
-                if current_cam:
-                    current_cam.MV_CC_StopGrabbing()
-                    current_cam.MV_CC_CloseDevice()
-                    current_cam.MV_CC_DestroyHandle()
-                    current_cam = None
-                await websocket.send(json.dumps({"status": "stream_stopped"}))
-                
-        except json.JSONDecodeError:
-            await websocket.send(json.dumps({"error": "Invalid JSON"}))
         except Exception as e:
-            await websocket.send(json.dumps({"error": str(e)}))
+            error_msg = {"error": str(e)}
+            await websocket.send(json.dumps(error_msg))
 
-async def main():
-    async with websockets.serve(handle_client, "0.0.0.0", 5000):
-        await asyncio.Future()
+# async def main():
+#     server = WebSocketServer()
+#     async with websockets.serve(server.handler, "localhost", 8765):
+#         print("WebSocket server started on ws://localhost:8765")
+#         await asyncio.Future()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    async def main():
+        server = WebSocketServer()
+        async with websockets.serve(server.handler, "localhost", 8765):
+            print("WebSocket server started on ws://localhost:8765")
+            await asyncio.Future()
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Server stopped by user")
