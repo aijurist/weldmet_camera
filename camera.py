@@ -379,3 +379,58 @@ class Camera:
                 self._interface.warning(str(e))
                 self.start_recording = False
                 self._interface.done_recording(RecordingStatistics(0, 0, 0, 0, 0))
+
+import time
+
+def main(device_manager, interface):
+    """
+    Test function to open the device, start frame acquisition for 10 seconds,
+    then stop and close the device.
+    """
+    try:
+        print("Initializing Camera...")
+        camera = Camera(device_manager, interface)
+        
+        if camera._device is None:
+            print("Failed to initialize camera.")
+            return
+        
+        print("Starting acquisition...")
+        if not camera.start_acquisition():
+            print("Failed to start acquisition.")
+            return
+        
+        time.sleep(5)  # Acquire frames for 10 seconds
+        
+        print("Stopping acquisition...")
+        camera.stop_acquisition()
+        
+    except Exception as e:
+        print(f"Test failed with exception: {str(e)}")
+    
+    finally:
+        print("Closing camera...")
+        camera.close()
+        print("Test completed.")
+        
+ids_peak.Library.Initialize()
+device_manager = ids_peak.DeviceManager.Instance()
+
+# Create a dummy interface or a real one if implemented
+class DummyInterface:
+    def set_camera(self, camera):
+        pass
+    
+    def warning(self, msg):
+        print(f"Warning: {msg}")
+    
+    def on_image_received(self, image):
+        print("Received an image.")
+    
+    def done_recording(self, stats):
+        print(f"Recording Done. Stats: {stats}")
+
+interface = DummyInterface()
+
+# Execute the test function
+main(device_manager, interface)
