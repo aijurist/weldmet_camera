@@ -209,8 +209,8 @@ class WebSocketServer:
                 await websocket.send(json.dumps({"status": "streaming_started"}))
                 
             elif command == 'stop_stream':
-                # self.cam_manager.stop_stream()
-                self.cam_manager.close_camera()
+                self.cam_manager.stop_stream()
+                # self.cam_manager.close_camera()
                 await websocket.send(json.dumps({"status": "streaming_stopped"}))
                 
         except Exception as e:

@@ -58,4 +58,9 @@ class CameraManager:
         
         return self.device_list
 
+camera = CameraManager()
+res = camera.enum_devices()
+
+for i in res:
+    print(i)
     
