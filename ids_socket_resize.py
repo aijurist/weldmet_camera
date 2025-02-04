@@ -62,7 +62,7 @@ class Camera:
         self._node_map.FindNode("UserSetSelector").SetCurrentEntry("Default")
         self._node_map.FindNode("UserSetLoad").Execute()
         self._node_map.FindNode("UserSetLoad").WaitUntilDone()
-
+        
     def _setup_device_and_datastream(self):
         self._datastream = self._device.DataStreams()[0].OpenDataStream()
         self._find_and_set_remote_device_enumeration("GainAuto", "Off")
