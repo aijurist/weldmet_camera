@@ -62,10 +62,15 @@ class Camera:
         self.stop_acquisition()
         if self._datastream:
             try:
+                # Flush again to ensure all buffers are discarded
+                self._datastream.Flush(ids_peak.DataStreamFlushMode_DiscardAll)
+                # Revoke all announced buffers
                 for buffer in self._datastream.AnnouncedBuffers():
                     self._datastream.RevokeBuffer(buffer)
             except Exception as e:
                 print(f"Exception (close): {str(e)}")
+            finally:
+                self._datastream = None
 
     def connect(self, device_index):
         if self.device is not None:
@@ -123,6 +128,7 @@ class Camera:
         if not self._acquisition_running:
             return
         try:
+            # buffer_value = self._node_map.FindNode("BufferStatusOutputQueueCount").Value()
             self._node_map.FindNode("AcquisitionStop").Execute()
             self._datastream.KillWait()
             self._datastream.StopAcquisition(ids_peak.AcquisitionStopMode_Default)
@@ -239,7 +245,7 @@ class WebSocketServer:
         self.streaming = False
         self.current_camera = None
         self.device_manager = ids_peak.DeviceManager.Instance()
-        self.frame_queue = Queue(maxsize=10)
+        self.frame_queue = Queue(maxsize=40)
         ids_peak.Library.Initialize()
 
     async def handler(self, websocket):
@@ -339,8 +345,11 @@ class WebSocketServer:
         if self.streaming and self.current_camera:
             self.streaming = False
             self.current_camera.stop_acquisition()
+            await asyncio.sleep(1.0)
             self.current_camera.close()
             self.current_camera = None
+            with self.frame_queue.mutex:
+                self.frame_queue.queue.clear()
             await websocket.send(json.dumps({"message": "Stream stopped"}))
         else:
             await websocket.send(json.dumps({"error": "No active stream"}))
