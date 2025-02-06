@@ -345,11 +345,23 @@ class WebSocketServer:
         else:
             await websocket.send(json.dumps({"error": "No active stream"}))
 
+    # def frame_producer(self):
+    #     while self.streaming:
+    #         try:
+    #             jpeg_bytes = self.current_camera.get_jpeg_frame()
+    #             if jpeg_bytes and not self.frame_queue.full():
+    #                 self.frame_queue.put(jpeg_bytes)
+    #         except:
+    #             break
+    
     def frame_producer(self):
         while self.streaming:
             try:
                 jpeg_bytes = self.current_camera.get_jpeg_frame()
-                if jpeg_bytes and not self.frame_queue.full():
+                if jpeg_bytes:
+                    # Discard old frame if queue is full
+                    if self.frame_queue.full():
+                        self.frame_queue.get_nowait()
                     self.frame_queue.put(jpeg_bytes)
             except:
                 break
@@ -403,7 +415,11 @@ class WebSocketServer:
 async def main():
     ids_peak.Library.Initialize()
     server = WebSocketServer()
-    async with websockets.serve(server.handler, "localhost", 8765):
+    async with websockets.serve(
+        server.handler, 
+        "localhost", 8765, 
+        compression=websockets.compression.SERVER
+    ):
         await asyncio.Future()
 
 if __name__ == "__main__":
