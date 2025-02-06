@@ -42,7 +42,8 @@ class CameraConfigurator:
         try:
             node = self.node_map.FindNode(name)
             print(f"{name}:")
-            print(f"  Current Value: {node.Value()}")
+            if hasattr(node, "Value"):
+                print(f"  Current Value: {node.Value()}")
             if not isinstance(node, (ids_peak.BooleanNode, ids_peak.EnumerationNode)):
                 if hasattr(node, 'Minimum'):
                     print(f"  Min Value: {node.Minimum()}")
