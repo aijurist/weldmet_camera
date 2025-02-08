@@ -7,9 +7,12 @@ import cv2
 from ids_peak import ids_peak
 from ids_peak_ipl import ids_peak_ipl
 from ids_peak import ids_peak_ipl_extension
+from turbojpeg import TurboJPEG, TJPF_BGR
 
 # Constants
 TARGET_PIXEL_FORMAT = ids_peak_ipl.PixelFormatName_BGRa8
+JPEG_QUALITY = 75          # Reduced JPEG quality for faster encoding
+BUFFER_TIMEOUT = 1000      # Reduced wait time (in ms) for a finished buffer
 
 class Camera:
     def __init__(self, device_manager, device_index=0):
@@ -28,6 +31,7 @@ class Camera:
         self.target_size = None
         self.killed = False
         self._get_device()
+        self.jpeg_encoder = TurboJPEG(r"C:\libjpeg-turbo-gcc64\bin\libturbojpeg.dll")
         if self._device:
             self._setup_device_and_datastream()
 
@@ -40,8 +44,7 @@ class Camera:
             raise RuntimeError("No devices found")
         if self.device_index >= len(self.device_manager.Devices()):
             raise IndexError("Invalid device index")
-        self._device = self.device_manager.Devices()[self.device_index].OpenDevice(
-            ids_peak.DeviceAccessType_Control)
+        self._device = self.device_manager.Devices()[self.device_index].OpenDevice(ids_peak.DeviceAccessType_Control)
         self._node_map = self._device.RemoteDevice().NodeMaps()[0]
         self.max_gain = self._node_map.FindNode("Gain").Maximum()
         self._node_map.FindNode("UserSetSelector").SetCurrentEntry("Default")
@@ -62,9 +65,7 @@ class Camera:
         self.stop_acquisition()
         if self._datastream:
             try:
-                # Flush again to ensure all buffers are discarded
                 self._datastream.Flush(ids_peak.DataStreamFlushMode_DiscardAll)
-                # Revoke all announced buffers
                 for buffer in self._datastream.AnnouncedBuffers():
                     self._datastream.RevokeBuffer(buffer)
             except Exception as e:
@@ -75,15 +76,13 @@ class Camera:
     def connect(self, device_index):
         if self.device is not None:
             self.disconnect()
-            
         devices = self.device_manager.Devices()
         if device_index >= len(devices):
             raise ValueError("Invalid device index")
-            
         self.device = devices[device_index].OpenDevice(ids_peak.DeviceAccessType_Control)
         self.node_map = self.device.RemoteDevice().NodeMaps()[0]
         print(f"Connected to {self.device.ModelName()}")
-        
+
     def _find_and_set_remote_device_enumeration(self, name: str, value: str):
         entries = self._node_map.FindNode(name).Entries()
         available_entries = [entry.SymbolicValue() for entry in entries if entry.IsAvailable()]
@@ -128,7 +127,6 @@ class Camera:
         if not self._acquisition_running:
             return
         try:
-            # buffer_value = self._node_map.FindNode("BufferStatusOutputQueueCount").Value()
             self._node_map.FindNode("AcquisitionStop").Execute()
             self._datastream.KillWait()
             self._datastream.StopAcquisition(ids_peak.AcquisitionStopMode_Default)
@@ -138,17 +136,36 @@ class Camera:
         except Exception as e:
             print(f"Exception (stop acquisition): {str(e)}")
 
+    # def get_jpeg_frame(self):
+    #     buffer = None
+    #     try:
+    #         buffer = self._datastream.WaitForFinishedBuffer(BUFFER_TIMEOUT)
+    #         image = ids_peak_ipl_extension.BufferToImage(buffer)
+    #         converted_image = image.ConvertTo(ids_peak_ipl.PixelFormatName_BGR8)
+    #         np_image = converted_image.get_numpy_3D()
+    #         if self.target_size:
+    #             np_image = cv2.resize(np_image, self.target_size)
+    #         success, jpeg_buffer = cv2.imencode('.jpg', np_image, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+    #         return jpeg_buffer.tobytes() if success else None
+    #     except Exception as e:
+    #         print(f"Error capturing frame: {str(e)}")
+    #         raise
+    #     finally:
+    #         if buffer:
+    #             self._datastream.QueueBuffer(buffer)
+    
     def get_jpeg_frame(self):
         buffer = None
         try:
-            buffer = self._datastream.WaitForFinishedBuffer(5000)
+            buffer = self._datastream.WaitForFinishedBuffer(BUFFER_TIMEOUT)
             image = ids_peak_ipl_extension.BufferToImage(buffer)
             converted_image = image.ConvertTo(ids_peak_ipl.PixelFormatName_BGR8)
             np_image = converted_image.get_numpy_3D()
             if self.target_size:
                 np_image = cv2.resize(np_image, self.target_size)
-            success, jpeg_buffer = cv2.imencode('.jpg', np_image, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
-            return jpeg_buffer.tobytes() if success else None
+            # Use TurboJPEG for faster encoding
+            jpeg_bytes = self.jpeg_encoder.encode(np_image, quality=JPEG_QUALITY)
+            return jpeg_bytes
         except Exception as e:
             print(f"Error capturing frame: {str(e)}")
             raise
@@ -156,7 +173,7 @@ class Camera:
             if buffer:
                 self._datastream.QueueBuffer(buffer)
 
-    # New methods for parameter handling
+
     def get_all_max(self):
         max_values = {}
         target_parameters = [
@@ -245,7 +262,7 @@ class WebSocketServer:
         self.streaming = False
         self.current_camera = None
         self.device_manager = ids_peak.DeviceManager.Instance()
-        self.frame_queue = Queue(maxsize=40)
+        self.frame_queue = Queue(maxsize=1)
         ids_peak.Library.Initialize()
 
     async def handler(self, websocket):
@@ -295,15 +312,12 @@ class WebSocketServer:
                 "interface": device.ParentInterface().DisplayName()
             })
         await websocket.send(json.dumps({"devices": devices}))
-        
+
     async def connect(self, data, websocket):
         device_index = data.get("index", 0)
         try:
-            # Stop any existing stream
             if self.streaming:
                 await self.stop_stream(websocket)
-
-            # Create camera and connect
             self.current_camera = Camera(self.device_manager, device_index)
             await websocket.send(json.dumps({
                 "message": f"Connected to {self.current_camera._device.ModelName()}"
@@ -314,7 +328,6 @@ class WebSocketServer:
     async def disconnect(self, websocket):
         if self.streaming:
             await self.stop_stream(websocket)
-        
         if self.current_camera:
             self.current_camera.close()
             self.current_camera = None
@@ -345,7 +358,7 @@ class WebSocketServer:
         if self.streaming and self.current_camera:
             self.streaming = False
             self.current_camera.stop_acquisition()
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.1)
             self.current_camera.close()
             self.current_camera = None
             with self.frame_queue.mutex:
@@ -354,25 +367,19 @@ class WebSocketServer:
         else:
             await websocket.send(json.dumps({"error": "No active stream"}))
 
-    # def frame_producer(self):
-    #     while self.streaming:
-    #         try:
-    #             jpeg_bytes = self.current_camera.get_jpeg_frame()
-    #             if jpeg_bytes and not self.frame_queue.full():
-    #                 self.frame_queue.put(jpeg_bytes)
-    #         except:
-    #             break
-    
     def frame_producer(self):
         while self.streaming:
             try:
                 jpeg_bytes = self.current_camera.get_jpeg_frame()
                 if jpeg_bytes:
-                    # Discard old frame if queue is full
                     if self.frame_queue.full():
-                        self.frame_queue.get_nowait()
+                        try:
+                            self.frame_queue.get_nowait()
+                        except Exception:
+                            pass
                     self.frame_queue.put(jpeg_bytes)
-            except:
+            except Exception as e:
+                print(f"Frame producer error: {e}")
                 break
 
     async def frame_consumer(self, websocket):
@@ -381,11 +388,11 @@ class WebSocketServer:
                 jpeg_bytes = self.frame_queue.get()
                 await websocket.send(jpeg_bytes)
                 self.frame_queue.task_done()
-            except:
+            except Exception as e:
+                print(f"Frame consumer error: {e}")
                 break
 
     async def send_max_values(self, websocket):
-        
         if not self.current_camera:
             await websocket.send(json.dumps({"error": "No camera connected"}))
             return
@@ -412,7 +419,7 @@ class WebSocketServer:
             return
         param = data.get("parameter")
         value = data.get("value")
-        if not param or not value:
+        if not param or value is None:
             await websocket.send(json.dumps({"error": "Missing parameter or value"}))
             return
         success = self.current_camera.set_parameter(param, value)
@@ -427,7 +434,7 @@ async def main():
     async with websockets.serve(
         server.handler, 
         "localhost", 8765, 
-        compression=websockets.compression.SERVER
+        compression=None,
     ):
         await asyncio.Future()
 
